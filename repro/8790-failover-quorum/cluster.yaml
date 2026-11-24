@@ -1,0 +1,33 @@
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: repro-8790
+spec:
+  instances: 2
+  imageName: ghcr.io/cloudnative-pg/postgresql:18-system-trixie
+  storage:
+    size: 10Gi
+  replicationSlots:
+    highAvailability:
+      enabled: true
+  managed:
+    roles:
+      - name: app
+        ensure: present
+        login: true
+        inRoles:
+          - pg_read_all_stats
+  postgresql:
+    synchronous:
+      method: any
+      number: 1
+      dataDurability: preferred
+      failoverQuorum: true
+    parameters:
+      max_wal_size: "128MB"
+      min_wal_size: "80MB"
+      checkpoint_timeout: "30s"
+      checkpoint_completion_target: "0.9"
+      shared_buffers: "512MB"
+      bgwriter_lru_maxpages: "0"
+      wal_keep_size: "4GB"
