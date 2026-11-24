@@ -250,6 +250,14 @@ Although this component is optional, it is highly recommended—especially for
 demonstration and learning purposes—as it offers valuable insight into the
 system’s behavior and performance.
 
+## Reproducing cloudnative-pg#8790
+
+The [`repro/8790-failover-quorum`](./repro/8790-failover-quorum/README.md)
+directory reproduces
+[cloudnative-pg#8790](https://github.com/cloudnative-pg/cloudnative-pg/issues/8790),
+a failover approved by the failover quorum that loses acknowledged commits.
+It runs on a kind cluster created by cloudnative-pg's `hack/setup-cluster.sh`.
+
 ## Demonstration with CNPG Playground
 
 The **CNPG Playground** offers a great environment for exploring the
