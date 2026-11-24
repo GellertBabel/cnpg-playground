@@ -6,10 +6,11 @@ on a local kind cluster. It contains a Go harness that opens the loss window
 from outside the Postgres pods, and the `Cluster` manifest it runs against.
 
 Tested end to end on 2026-11-24 on kind with the operator built from `main`
-(`4a29ae801`). Sections 3, 4, 5 and 9 ran as written, and so did the sweep,
-the crash cleanup and the `teardown` + `create` recovery in section 8. The
-first attempt at offset 1s reproduced the loss. Section 6 comes from an
-earlier run. The registry network steps in section 8 were not run.
+(`4a29ae801`). Sections 3, 5 and 9 ran as written (`load` and `deploy` in an
+earlier session on the same cluster). Section 4 ran without the `watch`
+wrapper. In section 8 the sweep, the crash cleanup and the `teardown` +
+`create` recovery ran. The first attempt at offset 1s reproduced the loss.
+Section 6 comes from an earlier run.
 
 ## 1. The idea
 
@@ -487,33 +488,9 @@ replica reaches the barrier.
   ./hack/setup-cluster.sh teardown
   ```
 
-  If the registry's own network `registry` is stale too, recreate it. These
-  four steps were not run in the end-to-end test. Detach the registry from it:
-
-  ```bash
-  docker network disconnect -f registry registry.dev
-  ```
-
-  Remove the network. If this fails with `active endpoints`, a `load` was
-  interrupted and left its builder attached; remove it with
-  `docker buildx rm cnpg-builder` and try again:
-
-  ```bash
-  docker network rm registry
-  ```
-
-  Create the network again:
-
-  ```bash
-  docker network create registry
-  ```
-
-  Attach the registry to it. The registry keeps running throughout, because
-  it was started with `--restart always`:
-
-  ```bash
-  docker network connect registry registry.dev
-  ```
+  If `registry.dev` itself still fails to start because its `registry`
+  network is stale, see `hack/testing-tools/common/40-utils-registry.sh` in
+  cloudnative-pg, which creates that network and the registry.
 
   Then create the cluster again and continue with `load` in section 3:
 
