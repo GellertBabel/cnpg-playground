@@ -5,6 +5,10 @@ This directory reproduces
 on a local kind cluster. It contains a Go harness that opens the loss window
 from outside the Postgres pods, and the `Cluster` manifest it runs against.
 
+Tested end to end on 2026-11-24 on kind with the operator built from `main`
+(`4a29ae801`): every check below passed, and the first attempt at offset 1s
+reproduced the loss.
+
 ## 1. The idea
 
 1. With `dataDurability: preferred`, the primary stops waiting for a replica
@@ -45,85 +49,145 @@ cloudnative-pg's `hack/setup-cluster.sh`, which builds the operator from
 whatever branch you have checked out and runs a local registry
 (`registry.dev`, port 5000 on your host) for the writer image.
 
-Set two paths for the rest of this guide:
+Set three variables for the rest of this guide:
 
 ```bash
 export CNPG_SRC=~/src/cloudnative-pg                            # your cloudnative-pg checkout
 export REPRO=~/src/cnpg-playground/repro/8790-failover-quorum   # this directory
+export CLUSTER_NAME=kind                                        # name of the kind cluster
 ```
 
 ## 3. Set up one cluster
 
-Build the operator from the branch you want to test (here `main`) and deploy it
-on a new kind cluster:
+Every command below is one step. Run them one at a time and read the output
+before going on. The checks (a) to (g) are the only things you need to verify.
+
+Go to the cloudnative-pg checkout:
 
 ```bash
 cd "$CNPG_SRC"
+```
+
+Pick the operator branch to test, here `main`:
+
+```bash
 git checkout main
+```
+
+Create a kind cluster named `kind` with one control plane and three workers,
+plus the `registry.dev` registry:
+
+```bash
 ./hack/setup-cluster.sh create
+```
+
+Build the operator image and push it to `registry.dev`:
+
+```bash
 TEST_UPGRADE_TO_V1=false ./hack/setup-cluster.sh load
+```
+
+Install the operator in the `cnpg-system` namespace:
+
+```bash
 ./hack/setup-cluster.sh deploy
 ```
 
-`create` makes a kind cluster with one control plane and three workers. Its
-name is `pg-operator-e2e-<kubernetes version>`, for example
-`pg-operator-e2e-v1-37-0`; `kind get clusters` shows it. It also switches your
-current `kubectl` context to `kind-<name>`. The harness always uses the current
-context, so check it before every run:
+Check (a): `create` switched your current `kubectl` context, and the harness
+always uses the current context. This must print `kind-kind`:
 
 ```bash
 kubectl config current-context
 ```
 
-Create the Postgres cluster: 2 instances, `method: any`, `number: 1`,
-`dataDurability: preferred`, `failoverQuorum: true`.
+Check (b): the operator is running. This must print `successfully rolled out`:
+
+```bash
+kubectl -n cnpg-system rollout status deploy/cnpg-controller-manager
+```
+
+Create the namespace for the test cluster:
 
 ```bash
 kubectl create namespace repro-8790
-kubectl apply -n repro-8790 -f "$REPRO/cluster.yaml"
-kubectl wait -n repro-8790 --for=condition=Ready cluster/repro-8790 --timeout=10m
 ```
 
-Build the harness, and the writer image that the harness starts as a Job. You
-push it through `localhost:5000`; the kind nodes pull it as
-`registry.dev:5000/cnpg-repro-writer:latest`, which is the harness default.
+Create the Postgres cluster: 2 instances, `method: any`, `number: 1`,
+`dataDurability: preferred`, `failoverQuorum: true`:
+
+```bash
+kubectl apply -n repro-8790 -f "$REPRO/cluster.yaml"
+```
+
+Check (c): the cluster becomes Ready. This must print `condition met`:
+
+```bash
+kubectl -n repro-8790 wait --for=condition=Ready cluster/repro-8790 --timeout=900s
+```
+
+Go to the harness:
 
 ```bash
 cd "$REPRO/harness"
+```
+
+Build the harness binary:
+
+```bash
 go build -o harness .
+```
+
+Build the writer image, which the harness starts as a Job:
+
+```bash
 docker build -t localhost:5000/cnpg-repro-writer:latest .
+```
+
+Push it to the registry. The kind nodes pull it as
+`registry.dev:5000/cnpg-repro-writer:latest`, the harness default:
+
+```bash
 docker push localhost:5000/cnpg-repro-writer:latest
 ```
 
 ## 4. Watch the window open by hand
 
-You can see the cause without killing anything. Find the two instances:
+You can see the cause without killing anything. List the pods and their roles:
 
 ```bash
-PRIMARY=$(kubectl -n repro-8790 get cluster repro-8790 -o jsonpath='{.status.currentPrimary}')
-REPLICA=$(kubectl -n repro-8790 get pods -l cnpg.io/cluster=repro-8790,cnpg.io/instanceRole=replica -o jsonpath='{.items[0].metadata.name}')
-echo "primary=$PRIMARY replica=$REPLICA"
+kubectl -n repro-8790 get pods -L cnpg.io/instanceRole
 ```
 
-In a second terminal, watch what the operator records. In a third, watch what
-the primary waits for. Set `PRIMARY` there too, or paste the name.
+The commands below assume `repro-8790-1` is the primary and `repro-8790-2` the
+replica. If the output shows the opposite, swap the two names.
+
+In a second terminal, watch what the operator records:
 
 ```bash
-watch -n1 "kubectl -n repro-8790 get failoverquorum repro-8790 -o jsonpath='{.status}'"
+watch -n1 -x kubectl -n repro-8790 get failoverquorum repro-8790 -o jsonpath='{.status}'
 ```
+
+It shows
+`{"method":"ANY","primary":"repro-8790-1","standbyNames":["repro-8790-2"],"standbyNumber":1}`.
+
+In a third terminal, watch what the primary waits for:
 
 ```bash
-watch -n1 "kubectl -n repro-8790 exec $PRIMARY -c postgres -- psql -XAtc 'SHOW synchronous_standby_names'"
+watch -n1 -x kubectl -n repro-8790 exec repro-8790-1 -c postgres -- psql -XAtc 'SHOW synchronous_standby_names'
 ```
 
-Fence the replica. Its Postgres stops, and because of `preferred` the primary
-stops waiting for it: `synchronous_standby_names` becomes empty and the
-replica leaves the `FailoverQuorum` status. From now on every commit has one
-copy only.
+It shows `ANY 1 ("repro-8790-2")`.
+
+Fence the replica:
 
 ```bash
-kubectl -n repro-8790 annotate cluster repro-8790 cnpg.io/fencedInstances="[\"$REPLICA\"]" --overwrite
+kubectl -n repro-8790 annotate cluster repro-8790 cnpg.io/fencedInstances='["repro-8790-2"]' --overwrite
 ```
+
+Its Postgres stops. Within about 30 seconds `synchronous_standby_names`
+becomes empty and the `FailoverQuorum` status becomes `{}`. Because of
+`preferred` the primary keeps accepting commits, and from now on every commit
+has one copy only.
 
 Unfence it:
 
@@ -131,29 +195,38 @@ Unfence it:
 kubectl -n repro-8790 annotate cluster repro-8790 cnpg.io/fencedInstances-
 ```
 
-Within seconds of the replica pod turning Ready, both watches show it again,
-for example `ANY 1 ("repro-8790-2")`. Nothing checked that it has received the WAL written
-while it was away. Here it catches up in a moment because nothing is writing.
-The harness adds load and a WAL delay so that "named" comes well before
-"caught up", and kills the primary in that gap.
+Within seconds of the replica pod turning Ready, both watches show it again:
+`ANY 1 ("repro-8790-2")` and `"standbyNames":["repro-8790-2"]`. Nothing
+checked that it has received the WAL written while it was away. Here it catches
+up in a moment because nothing is writing. The harness adds load and a WAL
+delay so that "named" comes well before "caught up", and kills the primary in
+that gap.
 
 Stop the two `watch` commands with Ctrl-C.
 
 ## 5. One real attempt
 
-Check the setup first. This validates the cluster and the nodes and changes
-nothing:
+All commands in this section run in `$REPRO/harness`.
+
+Check (d): the dry run. It finds the primary and the replica, checks that
+replication is streaming with the replica in the quorum and that the two pods
+run on different nodes, and changes nothing. It does not touch the nodes yet.
+It must end with `dry run ok`:
 
 ```bash
-cd "$REPRO/harness"
 ./harness run --dry-run
 ```
 
-It ends with `dry run ok`. Then run one attempt with a 1 second offset:
+Check (e): one attempt with a 1 second offset. It must end with
+`outcome=reproduced`, and the `acknowledged=... lost=...` line must show `lost`
+above 0:
 
 ```bash
 ./harness run --offset 1s
 ```
+
+If it prints another outcome, run it again, up to 3 times, with `--offset 1s`
+or `--offset 2s`.
 
 What it does, step by step:
 
@@ -174,19 +247,21 @@ What it does, step by step:
    acknowledged ids.
 
 The harness removes its faults, the fencing annotation and the writer Job at
-the end, also on Ctrl-C. The end of a reproduced run looks like this (numbers
-vary):
+the end, also on Ctrl-C. This is the end of the tested run, shortened:
 
 ```text
-hh:mm:ss replica repro-8790-2 Ready
-hh:mm:ss offset 1s reached; cutting primary->replica and force-deleting the primary
-hh:mm:ss at kill: FailoverQuorum: map[method:ANY primary:repro-8790-1 standbyNames:[repro-8790-2] standbyNumber:1]
-hh:mm:ss new primary: repro-8790-2 (replica)
-hh:mm:ss packets through the netem delay: <n> (err=<nil>)
-hh:mm:ss acknowledged=<n> namedAtAck=<n> lost=<n> lostWhileNamed=<n>
-hh:mm:ss lost ack: id=<id> ts=<time> named=false behind=true
+14:22:09 primary no longer waits for repro-8790-2 (FailoverQuorum: map[])
+14:22:09 WAL delayed by 2s from repro-8790-1 to repro-8790-2; replica down for 20s
+14:22:29 bringing replica repro-8790-2 back
+14:22:38 replica repro-8790-2 Ready
+14:22:39 offset 1s reached; cutting primary->replica and force-deleting the primary
+14:22:39 at kill: FailoverQuorum: map[method:ANY primary:repro-8790-1 standbyNames:[repro-8790-2] standbyNumber:1]
+14:22:56 new primary: repro-8790-2 (replica)
+14:22:56 packets through the netem delay: 17 (err=<nil>)
+14:22:56 acknowledged=44342 namedAtAck=6772 lost=37571 lostWhileNamed=1
+14:22:56 lost ack: id=6772 ts=2026-11-24T14:22:08.318220889Z named=false behind=true
 ...
-hh:mm:ss outcome=reproduced
+14:22:57 outcome=reproduced
 ```
 
 - `acknowledged`: commits the client saw succeed.
@@ -197,7 +272,9 @@ hh:mm:ss outcome=reproduced
 - `packets through the netem delay` must be above 0, otherwise the delay did
   not apply and the run counts as `harness_invalid`.
 - When something was lost, the harness also prints the replication and
-  promotion events from both Postgres pods (`log <pod> ...` lines).
+  promotion events from both Postgres pods (`log <pod> ...` lines). The old
+  primary was just deleted, so its line may only say
+  `the server rejected our request`; that is expected.
 
 The exit code is the outcome:
 
@@ -210,58 +287,132 @@ The exit code is the outcome:
 | 10 | `nothing_lost` | a failover happened and every acknowledged commit survived |
 | 11 | `no_failover` | nothing was promoted within 5 minutes; the faults were lifted and the data checked on whoever leads |
 
-Now look at why the operator promoted:
+Check (f): the operator promoted the stale replica. This must print a
+`Failing over` line with the replica as `newPrimary`:
 
 ```bash
-kubectl -n cnpg-system logs deploy/cnpg-controller-manager --since=15m | grep -E 'Quorum check algorithm results|Failing over'
+kubectl -n cnpg-system logs deploy/cnpg-controller-manager | grep 'Failing over'
 ```
 
-On `main` you see `Quorum check algorithm results` with
-`"isStronglyConsistent":true` and the stale replica in `readSet`, followed by
-`Failing over` with that replica as `newPrimary`.
+To see why it promoted, look at the quorum check just before it. On `main` it
+shows `"isStronglyConsistent":true` with the stale replica in `readSet`:
+
+```bash
+kubectl -n cnpg-system logs deploy/cnpg-controller-manager | grep 'Quorum check algorithm results'
+```
+
+Check (g): remove any leftover faults from the worker nodes. It must print
+`done`:
+
+```bash
+./harness cleanup
+```
 
 The primary and the replica swap roles after each attempt, and the harness
 finds them again on the next run.
 
 ## 6. Compare with the fix
 
-> Covered by the earlier multi-target run (2026-11-23), not by the end-to-end
-> test of this copy: `dev/8790` lost 0 of 9 attempts, and denied 9 of 9
-> failovers, 6 of them by the barrier.
+> Validated in the earlier multi-target run (2026-11-23), not in the
+> end-to-end test of this copy.
 
-Build and deploy the operator from `dev/8790`. The image tag stays
-`cloudnative-pg-testing:latest`, so restart the operator to pull the new build:
+That run used the original harness this copy was taken from, offsets 0, 1 and
+2 seconds, 3 attempts each:
+
+| Operator build | Commit | Attempts that lost acknowledged commits |
+|---|---|---|
+| `main` | `4a29ae801` | 7 of 9 |
+| PR #11932 | `ea6da5868` | 8 of 9 |
+| PR #11940 | `83f8f6a73` | 8 of 9 |
+| PR #11561 | `9c92dde7a` | 8 of 9 |
+| `dev/8790` | `85242e827` | 0 of 9 |
+
+On `dev/8790` every failover was denied, 6 of the 9 by the barrier. Every
+attempt without loss on `main` and the PRs was an offset-0 timing denial. This
+covers one setup only: `preferred`, `failoverQuorum: true`, 2 instances, and a
+primary force-deleted while the replica lagged.
+
+To try it yourself, go to the cloudnative-pg checkout:
 
 ```bash
 cd "$CNPG_SRC"
-git remote add gellert https://github.com/GellertBabel/cloudnative-pg.git
-git fetch gellert dev/8790
-git checkout --detach gellert/dev/8790
+```
+
+Fetch the fix branch:
+
+```bash
+git fetch https://github.com/GellertBabel/cloudnative-pg.git dev/8790
+```
+
+Check it out:
+
+```bash
+git checkout --detach FETCH_HEAD
+```
+
+Build and push the operator image:
+
+```bash
 TEST_UPGRADE_TO_V1=false ./hack/setup-cluster.sh load
+```
+
+Deploy it:
+
+```bash
 ./hack/setup-cluster.sh deploy
+```
+
+The image tag stays `cloudnative-pg-testing:latest`, so restart the operator to
+pull the new build:
+
+```bash
 kubectl -n cnpg-system rollout restart deploy/cnpg-controller-manager
+```
+
+Check (b) again:
+
+```bash
 kubectl -n cnpg-system rollout status deploy/cnpg-controller-manager
 ```
 
-Recreate the test cluster. Part of the fix runs in the instance manager inside
-the Postgres pods, and existing pods keep the old one.
+Part of the fix runs in the instance manager inside the Postgres pods, and
+existing pods keep the old one. Delete the test cluster:
 
 ```bash
-kubectl delete -n repro-8790 cluster repro-8790
+kubectl -n repro-8790 delete cluster repro-8790
+```
+
+Create it again:
+
+```bash
 kubectl apply -n repro-8790 -f "$REPRO/cluster.yaml"
-kubectl wait -n repro-8790 --for=condition=Ready cluster/repro-8790 --timeout=10m
-cd "$REPRO/harness"
+```
+
+Check (c) again:
+
+```bash
+kubectl -n repro-8790 wait --for=condition=Ready cluster/repro-8790 --timeout=900s
+```
+
+Run one attempt from `$REPRO/harness`:
+
+```bash
 ./harness run --offset 1s
-kubectl -n cnpg-system logs deploy/cnpg-controller-manager --since=15m | grep -E 'barrier|Failing over'
 ```
 
 Expect `outcome=no_failover` (exit code 11) with `lost=0`. The attempt waits
 the full 5 minutes for a promotion that does not come, then lifts the faults
-and the old primary leads again. The operator log shows
+and the old primary leads again. The operator log shows why:
+
+```bash
+kubectl -n cnpg-system logs deploy/cnpg-controller-manager | grep 'not promotable'
+```
+
+It prints
 `Replica has not received WAL up to the synchronous replication barrier, not promotable`
-with the replica's `receivedLsn` below `barrierLSN`, and no `Failing over`.
-The cost of the fix is availability: no failover until the replica reaches the
-barrier.
+with the replica's `receivedLsn` below `barrierLSN`, and there is no new
+`Failing over`. The cost of the fix is availability: no failover until the
+replica reaches the barrier.
 
 ## 7. lost and lostWhileNamed
 
@@ -280,10 +431,10 @@ barrier.
 ## 8. Pitfalls
 
 - Use offsets of 1s or 2s. At offset 0 the kill can land before the primary
-  has republished `FailoverQuorum`; the operator then denies the failover with
+  has republished `FailoverQuorum`. The operator then denies the failover with
   `Quorum check failed a unsupported synchronous nodes number`. That is a
   timing race, not a fix.
-- One attempt proves little. Sweep a few offsets, 3 times each; the results go
+- One attempt proves little. Sweep a few offsets, 3 times each. The results go
   to `runs/sweep-<label>-<time>/results.csv`, one row per attempt:
 
   ```bash
@@ -291,56 +442,93 @@ barrier.
   ```
 
 - If the harness was killed hard (`kill -9`, a closed laptop), its faults stay
-  on the nodes. Remove them, the fencing annotation and the writer Job. By
-  default `cleanup` works on the worker nodes of the current context:
+  on the nodes. Remove them:
 
   ```bash
   ./harness cleanup
+  ```
+
+  Then remove the fencing annotation:
+
+  ```bash
   kubectl -n repro-8790 annotate cluster repro-8790 cnpg.io/fencedInstances-
+  ```
+
+  Then delete the writer Job:
+
+  ```bash
   kubectl -n repro-8790 delete job repro-8790-writer --ignore-not-found
   ```
 
-- A restart of the Docker daemon can break name resolution on the kind nodes,
-  so they cannot pull from `registry.dev` any more. Find the registry's address
-  on the `kind` network and add it to `/etc/hosts` on each node
-  (`kind get nodes --name <name>` lists the nodes):
+- After a Docker restart, `registry.dev` or the `kind` network can be stale,
+  and the nodes can no longer pull images. Start over from the cloudnative-pg
+  checkout. First remove the kind cluster and the `kind` network:
 
   ```bash
-  docker inspect -f '{{(index .NetworkSettings.Networks "kind").IPAddress}}' registry.dev
-  docker exec <node> sh -c 'grep -q "registry.dev # repro-8790" /etc/hosts || echo "<registry.dev IP on the kind network> registry.dev # repro-8790" >> /etc/hosts'
+  ./hack/setup-cluster.sh teardown
   ```
 
-- Delete the cluster with `kind delete cluster --name <name>`, not with
-  `./hack/setup-cluster.sh teardown`. The teardown also disconnects
-  `registry.dev` from the `kind` network and removes that network, which breaks
-  any other kind cluster you have.
+  If the registry's own network is stale too, recreate it one step at a time:
 
-## 9. Results from the earlier run
+  ```bash
+  docker network disconnect -f registry registry.dev
+  ```
 
-Run on 2026-11-23 with the original harness this copy was taken from, offsets
-0, 1 and 2 seconds, 3 attempts each:
+  ```bash
+  docker network rm registry
+  ```
 
-| Operator build | Commit | Attempts that lost acknowledged commits |
-|---|---|---|
-| `main` | `4a29ae801` | 7 of 9 |
-| PR #11932 | `ea6da5868` | 8 of 9 |
-| PR #11940 | `83f8f6a73` | 8 of 9 |
-| PR #11561 | `9c92dde7a` | 8 of 9 |
-| `dev/8790` | `85242e827` | 0 of 9 |
+  ```bash
+  docker network create registry
+  ```
 
-Every attempt without loss on `main` and the PRs was an offset-0 timing denial.
-This covers one setup only: `preferred`, `failoverQuorum: true`, 2 instances,
-and a primary force-deleted while the replica lagged.
+  ```bash
+  docker network connect registry registry.dev
+  ```
 
-## 10. Cleanup
+  ```bash
+  docker start registry.dev
+  ```
+
+  Then create the cluster again and continue with `load` in section 3:
+
+  ```bash
+  ./hack/setup-cluster.sh create
+  ```
+
+- `./hack/setup-cluster.sh teardown` also disconnects `registry.dev` from the
+  `kind` network (and removes the network if nothing else uses it). If you have
+  other kind clusters, delete only this one:
+
+  ```bash
+  kind delete cluster --name kind
+  ```
+
+## 9. Cleanup
+
+Delete the test cluster and its namespace:
 
 ```bash
 kubectl delete namespace repro-8790
-kind get clusters
-kind delete cluster --name pg-operator-e2e-v1-37-0
+```
+
+Delete the kind cluster:
+
+```bash
+kind delete cluster --name kind
+```
+
+Remove the harness binary:
+
+```bash
 rm "$REPRO/harness/harness"
+```
+
+Remove the local writer image:
+
+```bash
 docker rmi localhost:5000/cnpg-repro-writer:latest
 ```
 
-Use the name `kind get clusters` printed. The `registry.dev` container and its
-volume stay; other kind clusters from `hack/setup-cluster.sh` use them too.
+The `registry.dev` container and its volume stay; other kind clusters from
+`hack/setup-cluster.sh` use them too.
