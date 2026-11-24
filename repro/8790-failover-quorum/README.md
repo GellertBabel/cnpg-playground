@@ -6,8 +6,10 @@ on a local kind cluster. It contains a Go harness that opens the loss window
 from outside the Postgres pods, and the `Cluster` manifest it runs against.
 
 Tested end to end on 2026-11-24 on kind with the operator built from `main`
-(`4a29ae801`): every check below passed, and the first attempt at offset 1s
-reproduced the loss.
+(`4a29ae801`). Sections 3, 4, 5 and 9 ran as written, and so did the sweep,
+the crash cleanup and the `teardown` + `create` recovery in section 8. The
+first attempt at offset 1s reproduced the loss. Section 6 comes from an
+earlier run. The registry network steps in section 8 were not run.
 
 ## 1. The idea
 
@@ -49,12 +51,22 @@ cloudnative-pg's `hack/setup-cluster.sh`, which builds the operator from
 whatever branch you have checked out and runs a local registry
 (`registry.dev`, port 5000 on your host) for the writer image.
 
-Set three variables for the rest of this guide:
+Set three variables for the rest of this guide. Your cloudnative-pg checkout:
 
 ```bash
-export CNPG_SRC=~/src/cloudnative-pg                            # your cloudnative-pg checkout
-export REPRO=~/src/cnpg-playground/repro/8790-failover-quorum   # this directory
-export CLUSTER_NAME=kind                                        # name of the kind cluster
+export CNPG_SRC=~/src/cloudnative-pg
+```
+
+This directory:
+
+```bash
+export REPRO=~/src/cnpg-playground/repro/8790-failover-quorum
+```
+
+The name of the kind cluster, which `hack/setup-cluster.sh` reads:
+
+```bash
+export CLUSTER_NAME=kind
 ```
 
 ## 3. Set up one cluster
@@ -434,11 +446,18 @@ replica reaches the barrier.
   has republished `FailoverQuorum`. The operator then denies the failover with
   `Quorum check failed a unsupported synchronous nodes number`. That is a
   timing race, not a fix.
-- One attempt proves little. Sweep a few offsets, 3 times each. The results go
-  to `runs/sweep-<label>-<time>/results.csv`, one row per attempt:
+- One attempt proves little. Sweep a few offsets, 3 times each (about 15
+  minutes). The results go to `runs/sweep-<label>-<time>/results.csv`, one row
+  per attempt, and the sweep ends with a summary table:
 
   ```bash
   ./harness sweep --offsets 0,1,2 --repeats 3 --label main
+  ```
+
+  To try the sweep quickly first, run one attempt at offset 1s:
+
+  ```bash
+  ./harness sweep --offsets 1 --repeats 1 --label main
   ```
 
 - If the harness was killed hard (`kill -9`, a closed laptop), its faults stay
@@ -454,7 +473,7 @@ replica reaches the barrier.
   kubectl -n repro-8790 annotate cluster repro-8790 cnpg.io/fencedInstances-
   ```
 
-  Then delete the writer Job:
+  Then delete the writer Job. It prints nothing if the Job is already gone:
 
   ```bash
   kubectl -n repro-8790 delete job repro-8790-writer --ignore-not-found
@@ -468,26 +487,32 @@ replica reaches the barrier.
   ./hack/setup-cluster.sh teardown
   ```
 
-  If the registry's own network is stale too, recreate it one step at a time:
+  If the registry's own network `registry` is stale too, recreate it. These
+  four steps were not run in the end-to-end test. Detach the registry from it:
 
   ```bash
   docker network disconnect -f registry registry.dev
   ```
 
+  Remove the network. If this fails with `active endpoints`, a `load` was
+  interrupted and left its builder attached; remove it with
+  `docker buildx rm cnpg-builder` and try again:
+
   ```bash
   docker network rm registry
   ```
+
+  Create the network again:
 
   ```bash
   docker network create registry
   ```
 
-  ```bash
-  docker network connect registry registry.dev
-  ```
+  Attach the registry to it. The registry keeps running throughout, because
+  it was started with `--restart always`:
 
   ```bash
-  docker start registry.dev
+  docker network connect registry registry.dev
   ```
 
   Then create the cluster again and continue with `load` in section 3:
@@ -518,10 +543,23 @@ Delete the kind cluster:
 kind delete cluster --name kind
 ```
 
+Check that it is gone. This must print `No kind clusters found.` (or list
+only your other clusters):
+
+```bash
+kind get clusters
+```
+
 Remove the harness binary:
 
 ```bash
 rm "$REPRO/harness/harness"
+```
+
+Remove the sweep results, if you ran a sweep:
+
+```bash
+rm -r "$REPRO/harness/runs"
 ```
 
 Remove the local writer image:
